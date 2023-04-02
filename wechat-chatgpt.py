@@ -3,11 +3,11 @@
 
 # Algorithm
 #   step 1 get the wechat chat window by its title
-#   step 2 taking screenshots
+#   step 2 taking screenshots: known limitations: OCR does not work well with multiple line messages
+#          to work around this limitation, we enlarge the chat window to be as wide as possible to have single line messages.
 #   step 3 extracting text using an OCR package
 #   step 4 sending text to OpenAI's API to obtain an answer
 #   step 5 sending the response back to the chat window
-
 import openai
 import time
 import cv2
@@ -35,14 +35,16 @@ import os
 # Replace this with the actual window title of the chat program
 # if not certain, run this program once to see all window titles.
 # some chat window has strange characters, so use the title prefix instead
-chat_window_title_prefix = 'SVCA VIP'
-#QUESTION_PREFIX = '@chatgpt'
-QUESTION_PREFIX = '机器人'
+#chat_window_title_prefix = 'chatgpt聊天'  # <<-------------- chat window title prefix
+chat_window_title_prefix = 'chatgpt test'  # <<-------------- chat window title prefix
+QUESTION_PREFIX = 'chatgpt'
+QUESTION_PREFIX2 = '机器人'
 
 # the input message box's start position to paste the answer to the chat window's input box
 # best download and use the "greenshot" program to find the coordinates of the chat window's input box: 
-inx = 1050
-iny = 1065
+inx = 1252   ## <<-------------- x of input cursor
+iny = 954  ## <<-------------- y of input cursor
+
 # which OpenAI model to use
 # the API key should be stored in the .env file
 MODEL = "gpt-3.5-turbo"
@@ -66,11 +68,15 @@ prev_image_array = np.array([],dtype=float)
 # using set to be sure that the question is unique
 question_dict = set() 
 
+# speed up the processing of individual lines
+# skip one if seen before 
+line_dict = set()
 
 # load the contents of the .env file into os.environ
 load_dotenv()
 
 # get the value of the API_KEY environment variable
+# usually saved into the .env file in the same directory as this script
 api_key = os.environ.get('API_KEY')
 
 if api_key is None:
@@ -78,7 +84,6 @@ if api_key is None:
     sys.exit(1)
 
 API_KEY = api_key
-IMG_NAME = '1.png'
 openai.api_key = API_KEY
 
 # msgs is a list of dictionaries.
@@ -102,7 +107,7 @@ def getAnswer(msg: str) -> str:
     # global variable msgs, accessible anywhere in the program
     # msgs is a list of dictionaries!
     global msgs
-    print('New message detected: ' + msg)
+    print('Step 3: Get answer for the new question: ' + msg)
 
     # append the user's message info as a dictionary to the msgs list
     msgs.append({"role": "user", "content": msg})
@@ -133,9 +138,13 @@ def getAnswer(msg: str) -> str:
 
 # Capture the new questions from the chat window
 # using OCR of the screenshot to extract the text, find the new questions starting with "@chatgpt"
-def capture_chat_text(window_title):
+# merge multiple lines into one question if a line is close to the previous line
+def capture_chat_text_for_new_questions(window_title):
     global prev_image_array
+    # must use local variable, otherwise the global variable will accumulate lines again?
+    merged_chat_text = []  # ordered list, with prefixes kept. keep original order of questions
     global question_dict
+    global line_dict
     result =[]      
     windows = gw.getWindowsWithTitle(window_title)
     if len(windows) <= 0:
@@ -170,23 +179,110 @@ def capture_chat_text(window_title):
         chat_text = ocr.ocr(current_image_array)
         # the output of ocr.ocr() is a list of a single entry, which is a list of tuples
         # very confusing and not intuitive at all!
+        
+        # let's try to merge neighboring lines into one line first
+        # the first entry of the tuple is the (x1, y1, x2, y2) coordinates of the bounding box
+        # we 
+        
+        # x --->   horizontal axis: column number
+        # y is vertical axis: row number
+
+        # (85,193)       (420, 194)
+        #   1                2
+        #
+        #   4                 3
+        # (85,207)         (420, 208)      
+        # ----------------
+        # [84.0, 214.0]    [420.0, 214.0]       // x1 vs. prev x4: almost the same diff<5,   ignore point 3. vs 2
+        #   1                  2                // y2 vs. prev y4: different diff<10   
+        #
+        #   4                  3
+        # [84.0, 228.0]  [420.0, 228.0]        
+        
+        # store the previous line's coordinate of its left bottom corner (point 4)        
+        prev_x4 = 0
+        prev_y4 = 0
+        prev_line = ""  # store the previous line's text, if any
+        
+        #each line is stored as a list of 2 elements:
+        #   0 [[x1,y1],[x2,y2],[x3,y3],[x4,y4]], 
+        #   1 [text, confidence] 
         for line in chat_text[0]:
-                line= line[-1][0]  # last entry of the tuple is the (text, confidence) pair. 
-                # check if the line contains a prefix string of "@chatgpt"
-                if line.startswith(QUESTION_PREFIX):
-                    # get the message after the prefix
-                    question = line.split(QUESTION_PREFIX)[1]   
-                    # trim the leading and trailing spaces
-                    question = question.strip()   
-                    if question not in question_dict:
-                        question_dict.add(question)
-                        print(f"New question: '{question}' has been found. Dict size is {len(question_dict)} now.")
-                        # print(question)                                                    
-                        # add the new question into a list of results
-                        result.append(question)
-                    else:
-                        print(f"The question: '{question}' has been asked before. Ignoring it.")
-                        
+            current_line = line[-1][0]  # last entry of the tuple is the (text, confidence) pair. 
+            
+            # if processed before, ignore it
+            if current_line in line_dict: 
+                continue
+            # save the current line into the line dictionary           
+            line_dict.add(current_line)
+            
+            # Now a totally new line to process
+            x1=line[0][0][0]
+            y1=line[0][0][1]            
+            # check if x1,y1 is close to the previous line's x4,y4
+            # current_line always becomes part of prev_line no matter what
+            # a prev_line is always valid
+            # we relax x1- prev_x4 to 15 instead of 5, because the text is not aligned
+            # due to some leading punctuation mark like . or , etc.
+            # the most important distance is the vertical distance, which is y1-prev_y4
+            # abs(x1-prev_x4) < 15 and
+            if len(prev_line) != 0 and ( abs(y1-prev_y4) < 15 ):
+                # merge the current line with the previous line if applicable
+                prev_line = prev_line + " " + current_line
+            else: 
+                # condition 1: no previous line, 
+                # 
+                # condition 2: the current line is too far away from the previous line
+                # we store the prev_line into the merged chart text, and start a new line                   
+                                
+                # check if first 5 letters are in English, if so, convert to lower case
+                #@chatgpt
+                if len(line)>5 and line[:5].isalpha():
+                    # convert English first 5 letters into all lower case
+                    line = line[:5].lower() + line[5:]                
+                # a matching prev_line is found, so we store it into the merged_chat_text
+                # next time we will skip it early    
+                
+                # condition 2: the current line is too far away from the previous line
+                # we only insert the prev_line if it has a matched prefix string of "@chatgpt"                    
+                if len(prev_line) != 0:
+                    #print (f"found a new question: {prev_line}")                                     
+                    print(f"Step 1: From screenshot, found and add a new merged question with prefix: {prev_line}")
+                    merged_chat_text.append(prev_line)                    
+                    # mistake: forgot to reset the prev_line to empty string
+                    prev_line = ""  # reset the prev_line to empty string
+                
+                # always making sure pev_line is a valid line if it is the first line of a list of continuous lines
+                # a fresh prev_line , only add it if it has a matched prefix string of "@chatgpt"   
+                if (current_line.startswith(QUESTION_PREFIX) or current_line.startswith(QUESTION_PREFIX2)):                    
+                    prev_line = current_line
+                
+            prev_x4 = line[0][3][0]
+            prev_y4 = line[0][3][1]    
+
+        # store the remaining of prev_line also 
+        if len(prev_line) != 0:
+            merged_chat_text.append(prev_line)                
+            
+        # then for merged lines, each will be unique questions with prefixes
+        # we just remove the prefix string of "@chatgpt" and store the question into the result list        
+        for line in merged_chat_text:
+            question = ""
+            # remove prefix string of "@chatgpt" if any
+            if (line.startswith(QUESTION_PREFIX)):
+                question = line.split(QUESTION_PREFIX)[1]
+            if (line.startswith(QUESTION_PREFIX2)):
+                question = line.split(QUESTION_PREFIX2)[1]
+            # trim the leading and trailing spaces
+            question = question.strip()       # mistake: line.strip() was used!
+            if question not in question_dict:
+                question_dict.add(question)
+                print(f"Step 2: Stripped prefix for the question: '{question}' has been found. Dict size is {len(question_dict)} now.")
+                # print(question)                                                    
+                # add the new question into a list of results
+                result.append(question)
+            else:
+                print(f"Step 2: The question: '{question}' has been asked before. Ignoring it.")
         return result                                                      
     else:
         print("Chat window named '{}' not found or not visible.".format(window_title))
@@ -225,12 +321,12 @@ if __name__ == '__main__':
     paddle_logger.setLevel(logging.ERROR)
     
     while True:
-        new_questions = capture_chat_text(chat_window_title)
+        new_questions = capture_chat_text_for_new_questions(chat_window_title)
         if new_questions:
             print('---------------------------------')
             for line in new_questions:                
                 answer = getAnswer(line)
-                print(answer)
+                print(f"Answer is {answer}")
                 # copy the answer to the clipboard
                 pyperclip.copy(answer)
                 # paste the answer to the chat window
